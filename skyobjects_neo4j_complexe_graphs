@@ -1,0 +1,290 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import logging
+import sys
+import time
+from py2neo import Graph
+from transformers import pipeline
+from functools import lru_cache
+
+# -------------------------------
+# Logging-Konfiguration
+# -------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('celestial_qa_system.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# -------------------------------
+# Verbindung zur Neo4j-Datenbank
+# -------------------------------
+try:
+    # Passen Sie die Verbindungsdetails an
+    graph = Graph("bolt://localhost:7687", auth=("username", "password"))
+    logging.info("Erfolgreich mit der Neo4j-Datenbank verbunden.")
+except Exception as e:
+    logging.error(f"Fehler beim Verbinden mit der Datenbank: {str(e)}")
+    sys.exit(1)
+
+# -------------------------------
+# Lokales Frage-Antwort-Modell laden (Hugging Face)
+# -------------------------------
+try:
+    # Wir verwenden hier ein englisches Modell als Beispiel; ersetzen Sie es durch ein deutsches Modell, falls gewÃ¼nscht.
+    model_name = "distilbert-base-uncased-distilled-squad"
+    qa_pipeline = pipeline(
+        "question-answering",
+        model=model_name,
+        tokenizer=model_name,
+        device=0  # Bei GPU: device=0, sonst device=-1
+    )
+    logging.info("Frage-Antwort-Modell erfolgreich geladen.")
+except Exception as e:
+    logging.error(f"Fehler beim Laden des Frage-Antwort-Modells: {str(e)}")
+    sys.exit(1)
+
+# -------------------------------
+# Funktionen zum Abfragen und Zusammenbauen des Kontexts
+# -------------------------------
+
+@lru_cache(maxsize=32)
+def get_available_objects():
+    """
+    LÃ¤dt alle verfÃ¼gbaren CelestialObjects aus der Datenbank (Caching).
+    """
+    try:
+        query = """
+        MATCH (obj:CelestialObject)
+        RETURN obj.name AS name
+        ORDER BY obj.name
+        """
+        results = graph.run(query).data()
+        return [result['name'] for result in results]
+    except Exception as e:
+        logging.error(f"Fehler beim Laden der verfÃ¼gbaren Objekte: {str(e)}")
+        raise
+
+def extract_object_name(question):
+    """
+    Extrahiert den Objektnamen aus der Frage anhand der in der Datenbank vorhandenen Namen.
+    """
+    try:
+        question_lower = question.lower()
+        available_objects = get_available_objects()
+        for obj in available_objects:
+            if obj.lower() in question_lower:
+                return obj
+        return None
+    except Exception as e:
+        logging.error(f"Fehler bei der Objektnamenerkennung: {str(e)}")
+        raise
+
+def query_object_with_relationships(object_name):
+    """
+    FÃ¼hrt eine komplexe Abfrage aus, die den gewÃ¼nschten CelestialObject,
+    seinen Ã¼bergeordneten Knoten (falls vorhanden) und alle Satelliten (die das Objekt umkreisen)
+    zurÃ¼ckgibt.
+    """
+    try:
+        query = """
+        MATCH (obj:CelestialObject {name: $object_name})
+        OPTIONAL MATCH (obj)-[:ORBIT_OF]->(parent:CelestialObject)
+        OPTIONAL MATCH (child:CelestialObject)-[:ORBIT_OF]->(obj)
+        RETURN obj, parent, collect(child) as satellites
+        """
+        result = graph.run(query, object_name=object_name).data()
+        return result[0] if result else None
+    except Exception as e:
+        logging.error(f"Fehler bei der Abfrage komplexer Objektbeziehungen: {str(e)}")
+        raise
+
+def assemble_context(object_data):
+    """
+    Baut einen ausfÃ¼hrlichen Kontext-String basierend auf den abgerufenen Daten.
+    Dieser Kontext enthÃ¤lt die Eigenschaften des Objekts und seine Orbit-Beziehungen.
+    """
+    try:
+        obj = object_data.get('obj')
+        parent = object_data.get('parent')
+        satellites = object_data.get('satellites')
+        
+        context = f"Name: {obj['name']}\n"
+        context += f"Typ: {obj.get('type', 'unbekannt')}\n"
+        context += f"Entfernung von der Erde: {obj.get('distance_from_earth_ly', 'unbekannt')} Lichtjahre\n"
+        context += f"GrÃ¶Ãe: {obj.get('size_km', 'unbekannt')} km\n"
+        context += f"Masse: {obj.get('mass_kg', 'unbekannt')} kg\n"
+        
+        if parent:
+            context += f"Orbitiert um: {parent['name']}\n"
+        if satellites:
+            sat_names = [sat['name'] for sat in satellites if sat and 'name' in sat]
+            if sat_names:
+                context += "Satelliten: " + ", ".join(sat_names) + "\n"
+        return context
+    except Exception as e:
+        logging.error(f"Fehler beim Zusammenbauen des Kontexts: {str(e)}")
+        raise
+
+def get_orbit_info(object_name):
+    """
+    FÃ¼hrt eine vereinfachte Abfrage aus, die speziell Orbit-Informationen liefert.
+    Liefert den Namen des Ã¼bergeordneten Objekts (falls vorhanden) und eine Liste der Satelliten.
+    """
+    try:
+        query = """
+        MATCH (obj:CelestialObject {name: $object_name})
+        OPTIONAL MATCH (obj)-[:ORBIT_OF]->(parent:CelestialObject)
+        OPTIONAL MATCH (child:CelestialObject)-[:ORBIT_OF]->(obj)
+        RETURN obj.name AS name, 
+               parent.name AS parent,
+               collect(child.name) AS satellites
+        """
+        result = graph.run(query, object_name=object_name).data()
+        return result[0] if result else None
+    except Exception as e:
+        logging.error(f"Fehler bei der Abfrage von Orbit-Informationen: {str(e)}")
+        raise
+
+def answer_orbit_question(question):
+    """
+    Behandelt speziell Fragen zu Orbit-Beziehungen.
+    Extrahiert das Objekt und liefert eine direkt formatierte Antwort zu Eltern- und Satellitenbeziehungen.
+    """
+    try:
+        object_name = extract_object_name(question)
+        if not object_name:
+            return "Ich konnte kein bekanntes Himmelsobjekt in der Frage finden."
+        orbit_info = get_orbit_info(object_name)
+        if not orbit_info:
+            return "Keine Orbit-Informationen fÃ¼r dieses Objekt gefunden."
+        
+        answers = []
+        if orbit_info.get('parent'):
+            answers.append(f"{object_name} umkreist {orbit_info['parent']}.")
+        if orbit_info.get('satellites'):
+            # Filtere leere EintrÃ¤ge
+            satellites = [sat for sat in orbit_info['satellites'] if sat]
+            if satellites:
+                answers.append(f"Folgende Objekte kreisen um {object_name}: {', '.join(satellites)}.")
+        if not answers:
+            return f"Keine Orbit-Beziehungen fÃ¼r {object_name} gefunden."
+        return " ".join(answers)
+    except Exception as e:
+        logging.error(f"Fehler bei der Orbit-Fragenverarbeitung: {str(e)}")
+        return "Ein Fehler ist bei der Verarbeitung der Orbit-Frage aufgetreten."
+
+def answer_question(question):
+    """
+    Beantwortet eine Benutzerfrage. Wenn orbit-relevante SchlÃ¼sselwÃ¶rter in der Frage enthalten sind,
+    wird eine direkte Antwort zu Orbit-Beziehungen generiert. Andernfalls wird ein detaillierter Kontext
+    aus dem Knowledge Graph erstellt und der QA-Pipeline Ã¼bergeben.
+    """
+    try:
+        # ÃberprÃ¼fen, ob die Frage orbit-relevante SchlÃ¼sselwÃ¶rter enthÃ¤lt.
+        orbit_keywords = ["umkreist", "umkreisen", "orbiten", "orbit"]
+        if any(kw in question.lower() for kw in orbit_keywords):
+            return answer_orbit_question(question)
+        
+        # Allgemeine Fragen: erst Objektnamen extrahieren und Informationen abrufen.
+        object_name = extract_object_name(question)
+        if not object_name:
+            return "Ich konnte kein bekanntes Himmelsobjekt in der Frage finden."
+        
+        object_data = query_object_with_relationships(object_name)
+        if not object_data:
+            return "Keine Daten zu diesem Objekt gefunden."
+        
+        # Zusammenbauen des Kontexts aus den Objektinformationen
+        context = assemble_context(object_data)
+        improved_context = (
+            "Bitte beantworte die folgende Frage kurz und prÃ¤zise basierend auf den folgenden Fakten:\n\n" +
+            context
+        )
+        # Ãbergabe von Frage und verbessertem Kontext an den QA-Pipeline
+        result = qa_pipeline(question=question, context=improved_context)
+        return result.get("answer", "Es konnte keine Antwort generiert werden.")
+    except Exception as e:
+        logging.error(f"Fehler bei der Frageverarbeitung: {str(e)}")
+        return "Ein Fehler ist bei der Verarbeitung der Frage aufgetreten."
+
+def reset_cache():
+    """Setzt den Cache fÃ¼r die verfÃ¼gbaren Objekte zurÃ¼ck."""
+    try:
+        get_available_objects.cache_clear()
+        logging.info("Cache wurde zurÃ¼ckgesetzt")
+    except Exception as e:
+        logging.error(f"Fehler beim ZurÃ¼cksetzen des Caches: {str(e)}")
+        raise
+
+def display_help():
+    """Zeigt Hilfe-Informationen an."""
+    help_text = """
+    VerfÃ¼gbare Befehle:
+    - exit: Beendet das Programm
+    - help: Zeigt diese Hilfe an
+    - update: Aktualisiert die Liste der verfÃ¼gbaren Objekte
+    - clear: Leert den Bildschirm
+
+    Beispielfragen:
+    - Wie weit ist [Objekt] von der Erde entfernt?
+    - Was ist [Objekt]?
+    - Beschreibe [Objekt].
+    - Welche Objekte umkreisen [Objekt]? (Orbit-Fragen)
+    """
+    print(help_text)
+
+# -------------------------------
+# Interaktive Hauptschleife
+# -------------------------------
+def main():
+    print("=== Celestial Knowledge Graph QA System ===")
+    print("Geben Sie 'help' ein fÃ¼r weitere Informationen.\n")
+    
+    # Anzeige der verfÃ¼gbaren Objekte (optional)
+    try:
+        available_objects = get_available_objects()
+        print("VerfÃ¼gbare Objekte:", ", ".join(available_objects), "\n")
+    except Exception as e:
+        print("Fehler beim Laden der verfÃ¼gbaren Objekte.")
+    
+    while True:
+        try:
+            user_input = input("Ihre Frage: ").strip()
+            if user_input.lower() == 'exit':
+                print("Auf Wiedersehen!")
+                break
+            elif user_input.lower() == 'help':
+                display_help()
+                continue
+            elif user_input.lower() == 'update':
+                reset_cache()
+                available_objects = get_available_objects()
+                print("Objektliste aktualisiert!")
+                print("VerfÃ¼gbare Objekte:", ", ".join(available_objects))
+                continue
+            elif user_input.lower() == 'clear':
+                print("\n" * 50)
+                continue
+            
+            start_time = time.time()
+            answer = answer_question(user_input)
+            elapsed = time.time() - start_time
+            
+            print("\nAntwort:", answer)
+            print(f"(Verarbeitungszeit: {elapsed:.2f} Sekunden)\n")
+        except Exception as e:
+            print(f"Fehler: {str(e)}")
+            logging.error(f"Verarbeitungsfehler: {str(e)}")
+            continue
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nProgramm wurde beendet.")
+        logging.info("Programm durch Benutzer beendet.")
